@@ -23,6 +23,7 @@ if typing.TYPE_CHECKING:
 __all__ = [
     "BulkCopyFailed",
     "CreateFailed",
+    "DestinationCopyError",
     "DestinationExists",
     "DirectoryExists",
     "DirectoryExpected",
@@ -51,6 +52,8 @@ __all__ = [
     "ResourceLocked",
     "ResourceNotFound",
     "ResourceReadOnly",
+    "SourceCopyError",
+    "TransactionalCopyError",
     "Unsupported",
     "UnsupportedHash",
 ]
@@ -106,6 +109,55 @@ class BulkCopyFailed(FSError):
     def __init__(self, errors):  # noqa: D107
         self.errors = errors
         super(BulkCopyFailed, self).__init__()
+
+
+class TransactionalCopyError(FSError):
+    """A transactional copy operation failed.
+
+    The destination filesystem has been restored to the state it was
+    in prior to the copy (on a best effort basis) before this exception
+    is raised.
+    """
+
+    default_message = "transactional copy from '{src_path}' to '{dst_path}' failed"
+
+    def __init__(
+        self,
+        src_path,  # type: Text
+        dst_path,  # type: Text
+        completed=None,  # type: Optional[list]
+        msg=None,  # type: Optional[Text]
+        exc=None,  # type: Optional[Exception]
+    ):  # noqa: D107
+        # type: (...) -> None
+        self.src_path = src_path
+        self.dst_path = dst_path
+        self.completed = [] if completed is None else list(completed)
+        self.exc = exc
+        self.details = "" if exc is None else text_type(exc)
+        super(TransactionalCopyError, self).__init__(msg=msg)
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (self.src_path, self.dst_path, self.completed, self._msg, self.exc),
+        )
+
+
+class SourceCopyError(TransactionalCopyError):
+    """The source side of a transactional copy failed."""
+
+    default_message = (
+        "error reading from source '{src_path}' during transactional copy"
+    )
+
+
+class DestinationCopyError(TransactionalCopyError):
+    """The destination side of a transactional copy failed."""
+
+    default_message = (
+        "error writing to destination '{dst_path}' during transactional copy"
+    )
 
 
 class CreateFailed(FSError):
