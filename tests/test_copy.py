@@ -6,11 +6,16 @@ import errno
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 from parameterized import parameterized
 
 import fs.copy
+import fs.errors
 from fs import open_fs
+from fs.memoryfs import MemoryFS
+from fs.path import normpath
+from fs.wrap import read_only
 
 
 def _create_sandbox_dir(prefix="pyfilesystem2_sandbox_", home=None):
@@ -1040,6 +1045,291 @@ class TestCopyIfNotExists(unittest.TestCase):
             self.assertTrue(dst_fs.isdir("bar"))
             self.assertTrue(dst_fs.isdir("empty"))
             self.assertTrue(dst_fs.isfile("bar/baz.txt"))
+        finally:
+            shutil.rmtree(src_dir)
+            shutil.rmtree(dst_dir)
+
+
+class _FailingOpenMemoryFS(MemoryFS):
+    """MemoryFS that refuses to open one particular file."""
+
+    def __init__(self, fail_path):
+        super(_FailingOpenMemoryFS, self).__init__()
+        self._fail_path = normpath(fail_path)
+
+    def openbin(self, path, mode="r", buffering=-1, **options):
+        if normpath(path) == self._fail_path:
+            raise fs.errors.PermissionDenied(path)
+        return super(_FailingOpenMemoryFS, self).openbin(
+            path, mode=mode, buffering=buffering, **options
+        )
+
+
+class _FailingMoveMemoryFS(MemoryFS):
+    """MemoryFS that fails the first move targeting one particular path."""
+
+    def __init__(self, fail_path):
+        super(_FailingMoveMemoryFS, self).__init__()
+        self._fail_path = normpath(fail_path)
+        self._failed = False
+
+    def move(self, src_path, dst_path, overwrite=False, preserve_time=False):
+        if not self._failed and normpath(dst_path) == self._fail_path:
+            self._failed = True
+            raise fs.errors.InsufficientStorage(dst_path)
+        return super(_FailingMoveMemoryFS, self).move(
+            src_path, dst_path, overwrite=overwrite, preserve_time=preserve_time
+        )
+
+
+class TestTransactionalCopy(unittest.TestCase):
+    def _make_source(self, tag=""):
+        src_fs = open_fs("mem://")
+        src_fs.makedirs("foo/bar")
+        src_fs.makedirs("foo/empty")
+        src_fs.writetext("test.txt", "hello" + tag)
+        src_fs.writetext("foo/bar/baz.txt", "baz" + tag)
+        return src_fs
+
+    def _assert_no_transaction_leftovers(self, dst_fs):
+        leftovers = [
+            name
+            for name in dst_fs.listdir("/")
+            if "__fs_transaction" in name
+        ]
+        self.assertEqual(leftovers, [])
+
+    def test_transactional_copy_fs(self):
+        src_fs = self._make_source()
+        dst_fs = open_fs("mem://")
+        fs.copy.copy_fs(src_fs, dst_fs, transactional=True)
+
+        self.assertTrue(dst_fs.isdir("foo/bar"))
+        self.assertTrue(dst_fs.isdir("foo/empty"))
+        self.assertEqual(dst_fs.readtext("test.txt"), "hello")
+        self.assertEqual(dst_fs.readtext("foo/bar/baz.txt"), "baz")
+        self._assert_no_transaction_leftovers(dst_fs)
+
+    def test_transactional_copy_dir(self):
+        src_fs = self._make_source()
+        dst_fs = open_fs("mem://")
+        fs.copy.copy_dir(
+            src_fs, "/foo", dst_fs, "/dst", transactional=True
+        )
+
+        self.assertTrue(dst_fs.isdir("/dst/bar"))
+        self.assertTrue(dst_fs.isdir("/dst/empty"))
+        self.assertEqual(dst_fs.readtext("/dst/bar/baz.txt"), "baz")
+        self._assert_no_transaction_leftovers(dst_fs)
+
+    def test_transactional_overwrites_existing(self):
+        src_fs = self._make_source()
+        dst_fs = open_fs("mem://")
+        dst_fs.makedirs("foo/bar")
+        dst_fs.writetext("test.txt", "old")
+        dst_fs.writetext("foo/bar/baz.txt", "old-baz")
+        dst_fs.writetext("untouched.txt", "untouched")
+
+        fs.copy.copy_fs(src_fs, dst_fs, transactional=True)
+
+        self.assertEqual(dst_fs.readtext("test.txt"), "hello")
+        self.assertEqual(dst_fs.readtext("foo/bar/baz.txt"), "baz")
+        self.assertEqual(dst_fs.readtext("untouched.txt"), "untouched")
+        self._assert_no_transaction_leftovers(dst_fs)
+
+    def test_transactional_preserve_time(self):
+        namespaces = ("details", "modified")
+        modified = datetime.datetime(2001, 2, 3, 4, 5, 6)
+
+        src_fs = open_fs("mem://")
+        src_fs.makedirs("foo/bar")
+        src_fs.writetext("foo/bar/baz.txt", "baz")
+        for path in ("foo", "foo/bar", "foo/bar/baz.txt"):
+            src_fs.setinfo(
+                path, {"details": {"modified": calendar.timegm(modified.timetuple())}}
+            )
+
+        dst_fs = open_fs("mem://")
+        fs.copy.copy_fs(src_fs, dst_fs, transactional=True, preserve_time=True)
+
+        for path in ("foo", "foo/bar", "foo/bar/baz.txt"):
+            self.assertEqual(
+                dst_fs.getinfo(path, namespaces).modified,
+                src_fs.getinfo(path, namespaces).modified,
+            )
+        self._assert_no_transaction_leftovers(dst_fs)
+
+    def test_transactional_on_copy(self):
+        src_fs = self._make_source()
+        dst_fs = open_fs("mem://")
+        copied = []
+
+        def _on_copy(src, src_path, dst, dst_path):
+            copied.append((src_path, dst_path))
+            self.assertTrue(dst.isfile(dst_path))
+
+        fs.copy.copy_fs(
+            src_fs, dst_fs, transactional=True, on_copy=_on_copy
+        )
+
+        self.assertEqual(
+            sorted(dst_path for _, dst_path in copied),
+            ["/foo/bar/baz.txt", "/test.txt"],
+        )
+
+    def test_transactional_rollback_on_source_error(self):
+        src_fs = _FailingOpenMemoryFS("/bad.txt")
+        src_fs.makedirs("dir")
+        src_fs.writetext("good.txt", "good")
+        src_fs.writetext("bad.txt", "bad")
+        dst_fs = open_fs("mem://")
+        dst_fs.writetext("keep.txt", "old-content")
+
+        with self.assertRaises(fs.errors.TransactionalSourceError) as context:
+            fs.copy.copy_fs(src_fs, dst_fs, transactional=True)
+
+        error = context.exception
+        self.assertEqual(error.src_path, "/")
+        self.assertEqual(error.dst_path, "/")
+        self.assertTrue(error.completed_steps)
+        self.assertIn("staged 'good.txt'", error.completed_steps)
+        self.assertIsInstance(error, fs.errors.TransactionalCopyFailed)
+        self.assertIsInstance(error.exc, fs.errors.PermissionDenied)
+
+        self.assertEqual(dst_fs.listdir("/"), ["keep.txt"])
+        self.assertEqual(dst_fs.readtext("keep.txt"), "old-content")
+        self._assert_no_transaction_leftovers(dst_fs)
+
+    def test_transactional_rollback_on_destination_error(self):
+        src_fs = open_fs("mem://")
+        for name in ("a.txt", "b.txt", "c.txt"):
+            src_fs.writetext(name, "new-" + name)
+        dst_fs = _FailingMoveMemoryFS("/b.txt")
+        for name in ("a.txt", "b.txt", "c.txt"):
+            dst_fs.writetext(name, "old-" + name)
+
+        with self.assertRaises(fs.errors.TransactionalDestinationError) as context:
+            fs.copy.copy_fs(src_fs, dst_fs, transactional=True)
+
+        error = context.exception
+        self.assertEqual(error.src_path, "/")
+        self.assertEqual(error.dst_path, "/")
+        self.assertTrue(
+            all(step.startswith("staged") for step in error.completed_steps[:3])
+        )
+        self.assertIn("committed 'a.txt'", error.completed_steps)
+        self.assertIsInstance(error.exc, fs.errors.InsufficientStorage)
+
+        self.assertEqual(sorted(dst_fs.listdir("/")), ["a.txt", "b.txt", "c.txt"])
+        for name in ("a.txt", "b.txt", "c.txt"):
+            self.assertEqual(dst_fs.readtext(name), "old-" + name)
+        self._assert_no_transaction_leftovers(dst_fs)
+
+    def test_transactional_read_only_destination_fails_early(self):
+        underlying = open_fs("mem://")
+        dst_fs = read_only(underlying)
+        src_fs = self._make_source()
+
+        with self.assertRaises(fs.errors.TransactionalDestinationError):
+            fs.copy.copy_fs(src_fs, dst_fs, transactional=True)
+
+        self.assertEqual(underlying.listdir("/"), [])
+
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "permissions are bypassed when running as root",
+    )
+    def test_transactional_unwritable_destination_fails_early(self):
+        dst_dir = _create_sandbox_dir()
+        src_dir = _create_sandbox_dir()
+        try:
+            src_fs = open_fs("osfs://" + src_dir)
+            src_fs.writetext("a.txt", "a")
+            src_fs.writetext("b.txt", "b")
+            dst_fs = open_fs("osfs://" + dst_dir)
+            os.chmod(dst_dir, 0o550)
+
+            with self.assertRaises(fs.errors.TransactionalDestinationError):
+                fs.copy.copy_fs(src_fs, dst_fs, transactional=True)
+
+            self.assertEqual(os.listdir(dst_dir), [])
+        finally:
+            os.chmod(dst_dir, 0o750)
+            shutil.rmtree(dst_dir)
+            shutil.rmtree(src_dir)
+
+    def test_transactional_lock_contention(self):
+        src_fs = self._make_source()
+        dst_fs = open_fs("mem://")
+        dst_fs.makedir("/__fs_transaction_lock__")
+
+        with self.assertRaises(fs.errors.TransactionalDestinationError) as context:
+            fs.copy.copy_fs(src_fs, dst_fs, transactional=True)
+
+        self.assertEqual(context.exception.src_path, "/")
+        self.assertEqual(context.exception.dst_path, "/")
+        self.assertEqual(
+            dst_fs.listdir("/"), ["__fs_transaction_lock__"]
+        )
+
+    def test_transactional_concurrent_copies(self):
+        def _make_src(tag, count=300):
+            src_fs = open_fs("mem://")
+            for index in range(count):
+                src_fs.writetext("f%03d.txt" % index, tag)
+            return src_fs
+
+        dst_fs = open_fs("mem://")
+        barrier = threading.Barrier(2)
+        results = []
+
+        def _worker(tag):
+            barrier.wait()
+            try:
+                fs.copy.copy_fs(_make_src(tag), dst_fs, transactional=True)
+            except fs.errors.TransactionalCopyFailed:
+                results.append("failed")
+            else:
+                results.append("succeeded:" + tag)
+
+        thread1 = threading.Thread(target=_worker, args=("one",))
+        thread2 = threading.Thread(target=_worker, args=("two",))
+        thread1.start()
+        thread2.start()
+        thread1.join()
+        thread2.join()
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len([r for r in results if r.startswith("succeeded")]), 1)
+        self.assertIn("failed", results)
+
+        winner = results[0][-3:] if results[0].startswith("succeeded") else results[1][-3:]
+        for index in range(300):
+            self.assertEqual(dst_fs.readtext("f%03d.txt" % index), winner)
+        self._assert_no_transaction_leftovers(dst_fs)
+
+    def test_transactional_copy_osfs(self):
+        src_dir = _create_sandbox_dir()
+        dst_dir = _create_sandbox_dir()
+        try:
+            src_fs = open_fs("osfs://" + src_dir)
+            src_fs.makedirs("foo/bar")
+            src_fs.writetext("foo/bar/baz.txt", "baz")
+            src_fs.writetext("top.txt", "new")
+            dst_fs = open_fs("osfs://" + dst_dir)
+            dst_fs.writetext("top.txt", "old")
+
+            fs.copy.copy_fs(
+                src_fs, dst_fs, transactional=True, preserve_time=True
+            )
+
+            self.assertEqual(
+                open(os.path.join(dst_dir, "top.txt")).read(), "new"
+            )
+            self.assertTrue(
+                os.path.isfile(os.path.join(dst_dir, "foo/bar/baz.txt"))
+            )
+            self.assertEqual(os.listdir(dst_dir).count("__fs_transaction_lock__"), 0)
         finally:
             shutil.rmtree(src_dir)
             shutil.rmtree(dst_dir)

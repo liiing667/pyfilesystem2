@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- Added a `transactional` parameter to `fs.copy.copy_fs` and `fs.copy.copy_dir`
+  which copies all files to temporary names first and renames them into place
+  only once every file has been copied, rolling the destination back to its
+  previous state on any failure. Added `fs.errors.TransactionalCopyFailed`,
+  `fs.errors.TransactionalSourceError` and
+  `fs.errors.TransactionalDestinationError`.
 - Added `filter_glob` and `exclude_glob` parameters to `fs.walk.Walker`.
   Closes [#459](https://github.com/PyFilesystem/pyfilesystem2/issues/459).
 

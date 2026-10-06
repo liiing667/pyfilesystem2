@@ -5,11 +5,19 @@ from __future__ import print_function, unicode_literals
 
 import typing
 
+import uuid
 import warnings
 
-from .errors import IllegalDestination, ResourceNotFound
+from .errors import (
+    DestinationExists,
+    FSError,
+    IllegalDestination,
+    ResourceNotFound,
+    TransactionalDestinationError,
+    TransactionalSourceError,
+)
 from .opener import manage_fs
-from .path import abspath, combine, frombase, isbase, normpath
+from .path import abspath, combine, dirname, frombase, isbase, normpath, recursepath
 from .tools import is_thread_safe
 from .walk import Walker
 
@@ -28,6 +36,7 @@ def copy_fs(
     on_copy=None,  # type: Optional[_OnCopy]
     workers=0,  # type: int
     preserve_time=False,  # type: bool
+    transactional=False,  # type: bool
 ):
     # type: (...) -> None
     """Copy the contents of one filesystem to another.
@@ -45,8 +54,29 @@ def copy_fs(
             a single-threaded copy.
         preserve_time (bool): If `True`, try to preserve mtime of the
             resources (defaults to `False`).
+        transactional (bool): If `True`, perform the copy as a single
+            all-or-nothing transaction (defaults to `False`). All files
+            are first written to temporary names and only renamed into
+            place once every file has been copied successfully. If any
+            step fails, everything written by the copy is rolled back
+            and the destination is restored to its previous state.
+            Concurrent transactional copies to the same destination are
+            serialized: while one transaction is in progress any other
+            raises `~fs.errors.TransactionalDestinationError`.
+            The ``workers`` argument is ignored in transactional mode,
+            files are copied sequentially.
 
     """
+    if transactional:
+        return _copy_dir_transactional(
+            src_fs,
+            "/",
+            dst_fs,
+            "/",
+            walker=walker,
+            on_copy=on_copy,
+            preserve_time=preserve_time,
+        )
     return copy_fs_if(
         src_fs, dst_fs, "always", walker, on_copy, workers, preserve_time=preserve_time
     )
@@ -333,6 +363,7 @@ def copy_dir(
     on_copy=None,  # type: Optional[_OnCopy]
     workers=0,  # type: int
     preserve_time=False,  # type: bool
+    transactional=False,  # type: bool
 ):
     # type: (...) -> None
     """Copy a directory from one filesystem to another.
@@ -352,8 +383,20 @@ def copy_dir(
             a single-threaded copy.
         preserve_time (bool): If `True`, try to preserve mtime of the
             resources (defaults to `False`).
+        transactional (bool): If `True`, perform the copy as a single
+            all-or-nothing transaction, see `copy_fs` for details.
 
     """
+    if transactional:
+        return _copy_dir_transactional(
+            src_fs,
+            src_path,
+            dst_fs,
+            dst_path,
+            walker=walker,
+            on_copy=on_copy,
+            preserve_time=preserve_time,
+        )
     copy_dir_if(
         src_fs,
         src_path,
@@ -460,6 +503,237 @@ def copy_dir_if(
                     ):
                         copier.copy(_src_fs, dir_path, _dst_fs, copy_path)
                         on_copy(_src_fs, dir_path, _dst_fs, copy_path)
+
+
+_TX_LOCK_DIR = "/__fs_transaction_lock__"
+_TX_STAGING_DIR = "/__fs_transaction_{}__"
+
+
+def _copy_dir_transactional(
+    src_fs,  # type: Union[FS, Text]
+    src_path,  # type: Text
+    dst_fs,  # type: Union[FS, Text]
+    dst_path,  # type: Text
+    walker=None,  # type: Optional[Walker]
+    on_copy=None,  # type: Optional[_OnCopy]
+    preserve_time=False,  # type: bool
+):
+    # type: (...) -> None
+    """Copy a directory as a single all-or-nothing transaction.
+
+    Every file is first copied to a unique temporary staging directory
+    on the destination filesystem. Only once every file has been staged
+    successfully are the staged copies renamed into place. Existing
+    destination files are renamed aside before they are replaced, so the
+    destination never has a window where a file is missing or truncated.
+
+    A lock directory at the root of the destination filesystem prevents
+    two transactional copies from running concurrently against the same
+    destination: the second copy raises
+    `~fs.errors.TransactionalDestinationError` without writing
+    anything.
+
+    Any failure rolls the destination back to the state it had before
+    the copy was started, and raises
+    `~fs.errors.TransactionalSourceError` or
+    `~fs.errors.TransactionalDestinationError` carrying the source and
+    destination paths and the list of completed steps.
+
+    """
+    on_copy = on_copy or (lambda *args: None)
+    walker = walker or Walker()
+    _src_path = abspath(normpath(src_path))
+    _dst_path = abspath(normpath(dst_path))
+    completed_steps = []  # type: typing.List[Text]
+
+    with manage_fs(src_fs, writeable=False) as _src_fs, manage_fs(
+        dst_fs, create=True
+    ) as _dst_fs:
+        if _src_fs == _dst_fs and isbase(_src_path, _dst_path):
+            raise IllegalDestination(dst_path)
+
+        # Fail before a single byte is written if the destination is
+        # known to be read only.
+        if _dst_fs.getmeta().get("read_only", False):
+            raise TransactionalDestinationError(
+                _src_path,
+                _dst_path,
+                completed_steps,
+                msg="destination filesystem is read only",
+            )
+
+        # Snapshot the source tree before the destination is touched, so
+        # that the staging files can never be picked up by the walk.
+        try:
+            src_dirs = list(walker.dirs(_src_fs, _src_path))
+            src_files = list(walker.files(_src_fs, _src_path))
+        except Exception as error:
+            raise TransactionalSourceError(
+                _src_path, _dst_path, completed_steps, exc=error
+            )
+
+        staging_dir = _TX_STAGING_DIR.format(uuid.uuid4().hex)
+        new_dir = combine(staging_dir, "new")
+        old_dir = combine(staging_dir, "old")
+        committed = []  # type: typing.List[typing.Tuple[Text, Optional[Text]]]
+        created_dirs = []  # type: typing.List[Text]
+        pending_backup = []  # type: typing.List[typing.Tuple[Text, Text]]
+        lock_acquired = False
+
+        def _rollback():
+            # type: () -> None
+            """Undo a partially committed transaction on the destination."""
+            for final_path, backup_path in reversed(committed):
+                try:
+                    _dst_fs.remove(final_path)
+                except Exception:
+                    pass
+                if backup_path is not None:
+                    try:
+                        _dst_fs.move(backup_path, final_path)
+                    except Exception:
+                        pass
+            for final_path, backup_path in pending_backup:
+                try:
+                    _dst_fs.move(backup_path, final_path)
+                except Exception:
+                    pass
+            for dir_path in sorted(
+                created_dirs, key=lambda path: path.count("/"), reverse=True
+            ):
+                try:
+                    _dst_fs.removedir(dir_path)
+                except Exception:
+                    pass
+
+        try:
+            # Acquire the transaction lock. This serializes concurrent
+            # transactional copies to the same destination, and also
+            # acts as a writability probe before any file is written.
+            try:
+                _dst_fs.makedir(_TX_LOCK_DIR)
+                lock_acquired = True
+            except DestinationExists:
+                raise TransactionalDestinationError(
+                    _src_path,
+                    _dst_path,
+                    completed_steps,
+                    msg="another transactional copy is already in progress",
+                )
+            except Exception as error:
+                raise TransactionalDestinationError(
+                    _src_path, _dst_path, completed_steps, exc=error
+                )
+
+            # Stage every file under a temporary name.
+            for src_file in src_files:
+                rel_path = frombase(_src_path, src_file)
+                tmp_path = combine(new_dir, rel_path)
+                try:
+                    _dst_fs.makedirs(dirname(tmp_path), recreate=True)
+                except Exception as error:
+                    raise TransactionalDestinationError(
+                        _src_path, _dst_path, completed_steps, exc=error
+                    )
+                try:
+                    read_file = _src_fs.openbin(src_file)
+                except Exception as error:
+                    raise TransactionalSourceError(
+                        _src_path, _dst_path, completed_steps, exc=error
+                    )
+                try:
+                    _dst_fs.upload(tmp_path, read_file)
+                except Exception as error:
+                    raise TransactionalDestinationError(
+                        _src_path, _dst_path, completed_steps, exc=error
+                    )
+                finally:
+                    read_file.close()
+                if preserve_time:
+                    try:
+                        copy_modified_time(_src_fs, src_file, _dst_fs, tmp_path)
+                    except Exception as error:
+                        raise TransactionalDestinationError(
+                            _src_path, _dst_path, completed_steps, exc=error
+                        )
+                completed_steps.append("staged '{}'".format(rel_path))
+
+            # Create the destination directory structure, remembering
+            # which directories are new so they can be rolled back.
+            dst_dirs = [
+                combine(_dst_path, frombase(_src_path, src_dir))
+                for src_dir in src_dirs
+            ]
+            if _dst_path != "/":
+                dst_dirs = [
+                    path
+                    for path in recursepath(_dst_path, reverse=True)
+                    if path != "/"
+                ] + dst_dirs
+            try:
+                for dst_dir in dst_dirs:
+                    if not _dst_fs.exists(dst_dir):
+                        created_dirs.append(dst_dir)
+                    _dst_fs.makedirs(dst_dir, recreate=True)
+            except Exception as error:
+                _rollback()
+                raise TransactionalDestinationError(
+                    _src_path, _dst_path, completed_steps, exc=error
+                )
+
+            # Commit: move each staged copy into place. Existing files
+            # are renamed aside first, so a failure can restore them and
+            # no destination path is ever missing its file.
+            try:
+                for src_file in src_files:
+                    rel_path = frombase(_src_path, src_file)
+                    final_path = combine(_dst_path, rel_path)
+                    tmp_path = combine(new_dir, rel_path)
+                    backup_path = None  # type: Optional[Text]
+                    if _dst_fs.exists(final_path):
+                        backup_path = combine(old_dir, rel_path)
+                        _dst_fs.makedirs(dirname(backup_path), recreate=True)
+                        _dst_fs.move(final_path, backup_path)
+                        pending_backup.append((final_path, backup_path))
+                    _dst_fs.move(tmp_path, final_path, overwrite=True)
+                    committed.append((final_path, backup_path))
+                    del pending_backup[:]
+                    completed_steps.append("committed '{}'".format(rel_path))
+                    on_copy(_src_fs, src_file, _dst_fs, final_path)
+            except Exception as error:
+                _rollback()
+                raise TransactionalDestinationError(
+                    _src_path, _dst_path, completed_steps, exc=error
+                )
+
+            # Preserve directory modification times, deepest directories
+            # first so that parent directories keep their own mtime.
+            if preserve_time:
+                dir_pairs = [
+                    (
+                        src_dir,
+                        combine(_dst_path, frombase(_src_path, src_dir)),
+                    )
+                    for src_dir in src_dirs
+                ]
+                dir_pairs.append((_src_path, _dst_path))
+                for src_dir, dst_dir in sorted(
+                    dir_pairs, key=lambda pair: pair[0].count("/"), reverse=True
+                ):
+                    try:
+                        copy_modified_time(_src_fs, src_dir, _dst_fs, dst_dir)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                _dst_fs.removetree(staging_dir)
+            except Exception:
+                pass
+            if lock_acquired:
+                try:
+                    _dst_fs.removedir(_TX_LOCK_DIR)
+                except Exception:
+                    pass
 
 
 def _copy_is_necessary(

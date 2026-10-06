@@ -51,6 +51,9 @@ __all__ = [
     "ResourceLocked",
     "ResourceNotFound",
     "ResourceReadOnly",
+    "TransactionalCopyFailed",
+    "TransactionalDestinationError",
+    "TransactionalSourceError",
     "Unsupported",
     "UnsupportedHash",
 ]
@@ -324,6 +327,74 @@ class ResourceReadOnly(ResourceError):
     """Attempting to modify a read-only resource."""
 
     default_message = "resource '{path}' is read only"
+
+
+class TransactionalCopyFailed(FSError):
+    """A transactional copy failed.
+
+    Any files or directories that the transaction had written to the
+    destination are rolled back, so the destination is left in the state
+    it was in before the copy was started.
+
+    Attributes:
+        src_path (str): The source directory of the copy.
+        dst_path (str): The destination directory of the copy.
+        completed_steps (list): Human-readable descriptions of the steps
+            that had been completed before the failure.
+        exc (Exception): The original exception that caused the failure,
+            if available.
+
+    """
+
+    default_message = (
+        "transactional copy from '{src_path}' to '{dst_path}' failed; {details}"
+    )
+
+    def __init__(
+        self,
+        src_path,  # type: Text
+        dst_path,  # type: Text
+        completed_steps=None,  # type: Optional[typing.List[Text]]
+        exc=None,  # type: Optional[Exception]
+        msg=None,  # type: Optional[Text]
+    ):  # noqa: D107
+        # type: (...) -> None
+        self.src_path = src_path
+        self.dst_path = dst_path
+        self.completed_steps = list(completed_steps) if completed_steps else []
+        self.exc = exc
+        self.details = "" if exc is None else text_type(exc)
+        super(TransactionalCopyFailed, self).__init__(msg=msg)
+
+    def __reduce__(self):
+        return (
+            type(self),
+            (
+                self.src_path,
+                self.dst_path,
+                self.completed_steps,
+                self.exc,
+                self._msg,
+            ),
+        )
+
+
+class TransactionalSourceError(TransactionalCopyFailed):
+    """A transactional copy failed because of an error on the source side."""
+
+    default_message = (
+        "source error during transactional copy from '{src_path}' "
+        "to '{dst_path}'; {details}"
+    )
+
+
+class TransactionalDestinationError(TransactionalCopyFailed):
+    """A transactional copy failed because of an error on the destination side."""
+
+    default_message = (
+        "destination error during transactional copy from '{src_path}' "
+        "to '{dst_path}'; {details}"
+    )
 
 
 class IllegalBackReference(ValueError):
